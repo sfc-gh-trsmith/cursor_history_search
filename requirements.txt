@@ -1,0 +1,18 @@
+# Cursor History Search - Dependencies
+# Install with: pip install -r requirements.txt
+
+# Vector similarity search
+faiss-cpu>=1.7.4
+
+# Sentence embeddings for semantic search
+sentence-transformers>=2.2.0
+
+# File locking for safe concurrent access
+filelock>=3.12.0
+
+# Web UI (optional, only needed for --server)
+streamlit>=1.28.0
+
+# Transitive dependencies (installed automatically)
+# numpy, torch, transformers, huggingface-hub
+
