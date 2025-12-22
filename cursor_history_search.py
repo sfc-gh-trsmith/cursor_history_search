@@ -492,7 +492,7 @@ def _streamlit_app():
 
     def run_reindex():
         # MAIN_SCRIPT_PATH is injected by cmd_server() when generating the app
-        script_path = Path(MAIN_SCRIPT_PATH) if 'MAIN_SCRIPT_PATH' in dir() else None
+        script_path = Path(MAIN_SCRIPT_PATH) if 'MAIN_SCRIPT_PATH' in globals() else None
         if not script_path or not script_path.exists():
             script_path = Path(__file__).parent / "cursor_history_search.py"
         if not script_path.exists():
@@ -2538,8 +2538,11 @@ def cmd_server(args):
     body_lines = lines[body_start:]
     body = textwrap.dedent('\n'.join(body_lines))
     
-    # Add a call to run the app (the function body is now top-level code)
-    # The body already contains the Streamlit code that runs at import time
+    # Inject the main script path so run_reindex() can find it
+    # Get the path to this script file
+    this_script = Path(__file__).resolve()
+    script_path_injection = f'MAIN_SCRIPT_PATH = "{this_script}"\n\n'
+    body = script_path_injection + body
     
     # Write the extracted code to temp file
     print(f"Writing Streamlit app to {STREAMLIT_APP_PATH}...")
