@@ -43,6 +43,16 @@ except ImportError as e:
     print("  pip install faiss-cpu sentence-transformers filelock")
     sys.exit(1)
 
+# Optional sklearn imports for clustering (graceful fallback)
+SKLEARN_AVAILABLE = False
+try:
+    from sklearn.cluster import KMeans
+    from sklearn.metrics import silhouette_score
+    from sklearn.manifold import TSNE
+    SKLEARN_AVAILABLE = True
+except ImportError:
+    pass  # Clustering features will be disabled
+
 
 # =============================================================================
 # Configuration
@@ -282,7 +292,8 @@ def _streamlit_app():
         """)
         row = cursor.fetchone()
         suggested, accepted, days = row[0] or 0, row[1] or 0, row[2]
-        acceptance_rate = (accepted / suggested * 100) if suggested > 0 else 0
+        # Cap at 100% - Cursor data sometimes has accepted > suggested
+        acceptance_rate = min((accepted / suggested * 100), 100.0) if suggested > 0 else 0
         
         cursor.execute("SELECT COUNT(DISTINCT project) FROM prompts")
         unique_projects = cursor.fetchone()[0]
@@ -506,6 +517,140 @@ def _streamlit_app():
         return result.returncode == 0, result.stdout + result.stderr
 
     # =========================================================================
+    # Clustering Functions
+    # =========================================================================
+
+    # Check sklearn availability for clustering
+    SKLEARN_AVAILABLE = False
+    try:
+        from sklearn.cluster import KMeans
+        from sklearn.metrics import silhouette_score
+        from sklearn.manifold import TSNE
+        SKLEARN_AVAILABLE = True
+    except ImportError:
+        pass
+
+    def find_optimal_clusters_st(embeddings, k_range=(2, 15), method="silhouette"):
+        """Determine optimal k using silhouette or elbow method."""
+        if not SKLEARN_AVAILABLE:
+            return 5, {"silhouette_scores": {}, "inertias": {}, "optimal_k": 5}
+        
+        min_k, max_k = k_range
+        max_k = min(max_k, len(embeddings) - 1)
+        
+        if max_k < min_k:
+            return min_k, {"silhouette_scores": {}, "inertias": {}, "optimal_k": min_k}
+        
+        silhouette_scores = {}
+        inertias = {}
+        
+        for k in range(min_k, max_k + 1):
+            kmeans = KMeans(n_clusters=k, random_state=42, n_init=10)
+            labels = kmeans.fit_predict(embeddings)
+            inertias[k] = kmeans.inertia_
+            if k < len(embeddings):
+                silhouette_scores[k] = silhouette_score(embeddings, labels)
+        
+        if method == "silhouette" and silhouette_scores:
+            optimal_k = max(silhouette_scores, key=silhouette_scores.get)
+        else:
+            # Elbow method
+            k_values = sorted(inertias.keys())
+            if len(k_values) < 3:
+                optimal_k = k_values[0]
+            else:
+                x = np.array(k_values)
+                y = np.array([inertias[k] for k in k_values])
+                x_norm = (x - x.min()) / (x.max() - x.min() + 1e-10)
+                y_norm = (y - y.min()) / (y.max() - y.min() + 1e-10)
+                p1, p2 = np.array([x_norm[0], y_norm[0]]), np.array([x_norm[-1], y_norm[-1]])
+                max_dist, elbow_idx = 0, 0
+                for i, (xi, yi) in enumerate(zip(x_norm, y_norm)):
+                    d = abs((p2[1]-p1[1])*xi - (p2[0]-p1[0])*yi + p2[0]*p1[1] - p2[1]*p1[0])
+                    d /= np.sqrt((p2[1]-p1[1])**2 + (p2[0]-p1[0])**2) + 1e-10
+                    if d > max_dist:
+                        max_dist, elbow_idx = d, i
+                optimal_k = k_values[elbow_idx]
+        
+        return optimal_k, {"silhouette_scores": silhouette_scores, "inertias": inertias, "optimal_k": optimal_k}
+
+    def cluster_prompts_st(embeddings, metadata, n_clusters=None, method="silhouette"):
+        """Cluster prompts based on embeddings."""
+        if not SKLEARN_AVAILABLE or len(embeddings) < 2:
+            return {
+                "labels": [0] * len(embeddings),
+                "n_clusters": 1,
+                "analysis": {},
+                "clusters": {0: [(i, metadata[i]) for i in range(len(metadata))]},
+                "silhouette_score": 0.0,
+            }
+        
+        analysis = {}
+        if n_clusters is None:
+            n_clusters, analysis = find_optimal_clusters_st(embeddings, method=method)
+        
+        kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
+        labels = kmeans.fit_predict(embeddings)
+        
+        clusters = {i: [] for i in range(n_clusters)}
+        for idx, label in enumerate(labels):
+            clusters[label].append((idx, metadata[idx]))
+        
+        final_silhouette = silhouette_score(embeddings, labels) if n_clusters > 1 else 0.0
+        
+        return {
+            "labels": labels.tolist(),
+            "n_clusters": n_clusters,
+            "analysis": analysis,
+            "clusters": clusters,
+            "cluster_centers": kmeans.cluster_centers_,
+            "silhouette_score": final_silhouette,
+        }
+
+    def reduce_to_2d_st(embeddings, perplexity=30):
+        """Reduce embeddings to 2D using t-SNE."""
+        if not SKLEARN_AVAILABLE or len(embeddings) < 2:
+            return np.zeros((len(embeddings), 2))
+        
+        perplexity = min(perplexity, max(5, len(embeddings) - 1))
+        tsne = TSNE(n_components=2, perplexity=perplexity, random_state=42, n_iter=1000, init='pca', learning_rate='auto')
+        return tsne.fit_transform(embeddings)
+
+    def get_cluster_keywords_st(prompts, top_n=10):
+        """Extract top keywords from prompts."""
+        stopwords = {
+            'the', 'a', 'an', 'is', 'it', 'to', 'and', 'of', 'in', 'for', 'on', 'with',
+            'this', 'that', 'i', 'you', 'we', 'be', 'are', 'was', 'have', 'has', 'do',
+            'does', 'can', 'will', 'would', 'should', 'could', 'if', 'then', 'else',
+            'when', 'what', 'how', 'why', 'where', 'which', 'who', 'or', 'not', 'no',
+            'yes', 'my', 'your', 'our', 'their', 'its', 'as', 'at', 'by', 'from',
+            'into', 'about', 'all', 'any', 'but', 'so', 'up', 'out', 'just', 'now',
+            'only', 'also', 'than', 'more', 'some', 'very', 'too', 'each', 'other',
+            'such', 'make', 'like', 'use', 'get', 'add', 'new', 'please', 'want',
+            'need', 'code', 'file', 'using', 'create', 'change', 'update',
+        }
+        word_freq = {}
+        for prompt in prompts:
+            text = prompt.get('text', '') if isinstance(prompt, dict) else str(prompt)
+            for word in text.lower().split():
+                word = ''.join(c for c in word if c.isalnum())
+                if len(word) > 2 and word not in stopwords:
+                    word_freq[word] = word_freq.get(word, 0) + 1
+        return [w for w, _ in sorted(word_freq.items(), key=lambda x: x[1], reverse=True)[:top_n]]
+
+    @st.cache_data(ttl=300)
+    def compute_clustering(_embeddings_hash, embeddings_list, metadata, n_clusters, method):
+        """Cached clustering computation."""
+        embeddings = np.array(embeddings_list)
+        return cluster_prompts_st(embeddings, metadata, n_clusters, method)
+
+    @st.cache_data(ttl=300)
+    def compute_tsne(_embeddings_hash, embeddings_list):
+        """Cached t-SNE computation."""
+        embeddings = np.array(embeddings_list)
+        return reduce_to_2d_st(embeddings)
+
+    # =========================================================================
     # Page Config and CSS
     # =========================================================================
 
@@ -636,7 +781,7 @@ def _streamlit_app():
 
     else:
         # Tab Navigation
-        tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(["📊 Dashboard", "🔍 Search", "📈 Analytics", "📅 Timeline", "🔤 Patterns", "📥 Export"])
+        tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(["📊 Dashboard", "🔍 Search", "📈 Analytics", "📅 Timeline", "🔤 Patterns", "🎯 Clusters", "📥 Export"])
         
         # =====================================================================
         # Dashboard Tab
@@ -851,9 +996,169 @@ def _streamlit_app():
                 st.warning("No prompts found. Run 'Re-index' first.")
         
         # =====================================================================
-        # Export Tab
+        # Clusters Tab
         # =====================================================================
         with tab6:
+            st.title("Prompt Clusters")
+            
+            if not SKLEARN_AVAILABLE:
+                st.error("Clustering requires scikit-learn. Install with: `pip install scikit-learn`")
+            else:
+                index, metadata, _ = load_index()
+                
+                if not metadata:
+                    st.warning("No prompts found. Run 'Re-index' first.")
+                else:
+                    # Controls
+                    col1, col2, col3 = st.columns([2, 2, 2])
+                    with col1:
+                        method = st.selectbox("Optimization Method", ["silhouette", "elbow"], 
+                            help="Silhouette: picks k with best cluster separation. Elbow: finds the 'knee' in the inertia curve.")
+                    with col2:
+                        auto_k = st.checkbox("Auto-detect clusters", value=True)
+                    with col3:
+                        if auto_k:
+                            k_range = st.slider("K search range", 2, 20, (2, 12))
+                        else:
+                            manual_k = st.slider("Number of clusters", 2, 20, 5)
+                    
+                    # Load embeddings from FAISS index
+                    if index is not None:
+                        # Reconstruct embeddings from FAISS
+                        n_prompts = index.ntotal
+                        embeddings = np.zeros((n_prompts, EMBEDDING_DIM), dtype=np.float32)
+                        for i in range(n_prompts):
+                            embeddings[i] = index.reconstruct(i)
+                        
+                        # Create hash for caching
+                        embeddings_hash = hash(embeddings.tobytes())
+                        
+                        # Compute clustering
+                        with st.spinner("Computing clusters..."):
+                            n_clusters = None if auto_k else manual_k
+                            result = compute_clustering(
+                                embeddings_hash, 
+                                embeddings.tolist(), 
+                                metadata, 
+                                n_clusters, 
+                                method
+                            )
+                        
+                        # Display metrics
+                        st.markdown("---")
+                        mcol1, mcol2, mcol3, mcol4 = st.columns(4)
+                        with mcol1:
+                            st.metric("Clusters", result["n_clusters"])
+                        with mcol2:
+                            st.metric("Silhouette Score", f"{result['silhouette_score']:.3f}")
+                        with mcol3:
+                            st.metric("Total Prompts", len(metadata))
+                        with mcol4:
+                            avg_size = len(metadata) / result["n_clusters"] if result["n_clusters"] > 0 else 0
+                            st.metric("Avg Cluster Size", f"{avg_size:.0f}")
+                        
+                        # Analysis charts (silhouette and elbow curves)
+                        analysis = result.get("analysis", {})
+                        if analysis.get("silhouette_scores") or analysis.get("inertias"):
+                            st.subheader("Cluster Analysis")
+                            chart_col1, chart_col2 = st.columns(2)
+                            
+                            with chart_col1:
+                                if analysis.get("silhouette_scores"):
+                                    import pandas as pd
+                                    sil_data = analysis["silhouette_scores"]
+                                    df_sil = pd.DataFrame([
+                                        {"k": k, "Silhouette Score": v} 
+                                        for k, v in sorted(sil_data.items())
+                                    ])
+                                    st.markdown("**Silhouette Score by K**")
+                                    st.line_chart(df_sil.set_index("k"))
+                            
+                            with chart_col2:
+                                if analysis.get("inertias"):
+                                    import pandas as pd
+                                    inertia_data = analysis["inertias"]
+                                    df_elbow = pd.DataFrame([
+                                        {"k": k, "Inertia": v} 
+                                        for k, v in sorted(inertia_data.items())
+                                    ])
+                                    st.markdown("**Elbow Curve (Inertia)**")
+                                    st.line_chart(df_elbow.set_index("k"))
+                        
+                        # 2D Scatter Plot Visualization
+                        st.subheader("Cluster Visualization (t-SNE)")
+                        
+                        with st.spinner("Computing t-SNE projection..."):
+                            coords_2d = compute_tsne(embeddings_hash, embeddings.tolist())
+                        
+                        import pandas as pd
+                        
+                        # Prepare data for scatter plot
+                        scatter_data = []
+                        for idx, (x, y) in enumerate(coords_2d):
+                            label = result["labels"][idx]
+                            text = metadata[idx]["text"][:100] + "..." if len(metadata[idx]["text"]) > 100 else metadata[idx]["text"]
+                            scatter_data.append({
+                                "x": float(x),
+                                "y": float(y),
+                                "cluster": f"Cluster {label}",
+                                "prompt": text,
+                                "project": metadata[idx].get("project", "Unknown"),
+                            })
+                        
+                        df_scatter = pd.DataFrame(scatter_data)
+                        
+                        # Use plotly if available for interactive plot, else use altair
+                        try:
+                            import plotly.express as px
+                            fig = px.scatter(
+                                df_scatter, x="x", y="y", color="cluster",
+                                hover_data=["prompt", "project"],
+                                title="",
+                                labels={"x": "t-SNE 1", "y": "t-SNE 2"},
+                                height=500,
+                            )
+                            fig.update_traces(marker=dict(size=8, opacity=0.7))
+                            fig.update_layout(legend=dict(orientation="h", yanchor="bottom", y=1.02))
+                            st.plotly_chart(fig, use_container_width=True)
+                        except ImportError:
+                            # Fallback to altair/streamlit native
+                            st.scatter_chart(df_scatter, x="x", y="y", color="cluster", height=500)
+                        
+                        # Cluster List View
+                        st.subheader("Cluster Details")
+                        
+                        clusters = result["clusters"]
+                        for cluster_id in sorted(clusters.keys()):
+                            cluster_prompts = clusters[cluster_id]
+                            keywords = get_cluster_keywords_st([p[1] for p in cluster_prompts], top_n=8)
+                            
+                            with st.expander(f"Cluster {cluster_id} — {len(cluster_prompts)} prompts — Keywords: {', '.join(keywords[:5])}"):
+                                # Show cluster stats
+                                projects_in_cluster = {}
+                                for _, prompt in cluster_prompts:
+                                    proj = prompt.get("project", "Unknown")
+                                    projects_in_cluster[proj] = projects_in_cluster.get(proj, 0) + 1
+                                
+                                st.markdown(f"**Projects:** {', '.join(f'{p} ({c})' for p, c in sorted(projects_in_cluster.items(), key=lambda x: -x[1])[:5])}")
+                                st.markdown(f"**Keywords:** {', '.join(keywords)}")
+                                
+                                st.markdown("**Sample prompts:**")
+                                for i, (idx, prompt) in enumerate(cluster_prompts[:10]):
+                                    text = prompt["text"]
+                                    if len(text) > 200:
+                                        text = text[:200] + "..."
+                                    st.markdown(f'<div class="context-prompt"><small>#{idx}</small> {text}</div>', unsafe_allow_html=True)
+                                
+                                if len(cluster_prompts) > 10:
+                                    st.caption(f"... and {len(cluster_prompts) - 10} more prompts")
+                    else:
+                        st.warning("FAISS index not found. Run 'Re-index' first.")
+        
+        # =====================================================================
+        # Export Tab
+        # =====================================================================
+        with tab7:
             st.title("Export Data")
             
             format_opt = st.selectbox("Format", ["Markdown", "JSON"])
@@ -1463,7 +1768,8 @@ def get_dashboard_kpis(db_path: Path = None) -> Dict[str, Any]:
     suggested = row[0] or 0
     accepted = row[1] or 0
     days_tracked = row[2]
-    acceptance_rate = (accepted / suggested * 100) if suggested > 0 else 0
+    # Cap at 100% - Cursor data sometimes has accepted > suggested
+    acceptance_rate = min((accepted / suggested * 100), 100.0) if suggested > 0 else 0
     
     # Get unique projects
     cursor.execute("SELECT COUNT(DISTINCT project) FROM prompts")
@@ -1663,6 +1969,237 @@ def generate_embeddings(texts: List[str]) -> np.ndarray:
     model = get_embedding_model()
     embeddings = model.encode(texts, show_progress_bar=True, convert_to_numpy=True)
     return embeddings.astype('float32')
+
+
+# =============================================================================
+# Clustering Functions
+# =============================================================================
+
+def find_optimal_clusters(
+    embeddings: np.ndarray,
+    k_range: Tuple[int, int] = (2, 15),
+    method: str = "silhouette"
+) -> Tuple[int, Dict[str, Any]]:
+    """
+    Determine optimal number of clusters using silhouette score or elbow method.
+    
+    Args:
+        embeddings: Normalized embedding vectors (n_samples, n_features)
+        k_range: Tuple of (min_k, max_k) to try
+        method: "silhouette" (default) or "elbow"
+    
+    Returns:
+        Tuple of (optimal_k, analysis_data) where analysis_data contains:
+        - silhouette_scores: dict of k -> score
+        - inertias: dict of k -> inertia (for elbow method)
+        - optimal_k: the selected k value
+    """
+    if not SKLEARN_AVAILABLE:
+        raise RuntimeError("scikit-learn is required for clustering. Install with: pip install scikit-learn")
+    
+    min_k, max_k = k_range
+    max_k = min(max_k, len(embeddings) - 1)  # Can't have more clusters than samples
+    
+    if max_k < min_k:
+        return min_k, {"silhouette_scores": {}, "inertias": {}, "optimal_k": min_k}
+    
+    silhouette_scores = {}
+    inertias = {}
+    
+    for k in range(min_k, max_k + 1):
+        kmeans = KMeans(n_clusters=k, random_state=42, n_init=10)
+        labels = kmeans.fit_predict(embeddings)
+        
+        # Store inertia for elbow method
+        inertias[k] = kmeans.inertia_
+        
+        # Compute silhouette score
+        if k < len(embeddings):
+            score = silhouette_score(embeddings, labels)
+            silhouette_scores[k] = score
+    
+    # Determine optimal k based on method
+    if method == "silhouette" and silhouette_scores:
+        optimal_k = max(silhouette_scores, key=silhouette_scores.get)
+    else:
+        # Elbow method: find the "knee" point using second derivative
+        optimal_k = _find_elbow_point(inertias)
+    
+    return optimal_k, {
+        "silhouette_scores": silhouette_scores,
+        "inertias": inertias,
+        "optimal_k": optimal_k,
+    }
+
+
+def _find_elbow_point(inertias: Dict[int, float]) -> int:
+    """
+    Find the elbow point in the inertia curve using the kneedle algorithm.
+    Returns the k value at the elbow.
+    """
+    if not inertias:
+        return 2
+    
+    k_values = sorted(inertias.keys())
+    if len(k_values) < 3:
+        return k_values[0]
+    
+    # Normalize the data
+    x = np.array(k_values)
+    y = np.array([inertias[k] for k in k_values])
+    
+    # Normalize to [0, 1]
+    x_norm = (x - x.min()) / (x.max() - x.min()) if x.max() != x.min() else x
+    y_norm = (y - y.min()) / (y.max() - y.min()) if y.max() != y.min() else y
+    
+    # Find the point with maximum distance from the line connecting first and last points
+    p1 = np.array([x_norm[0], y_norm[0]])
+    p2 = np.array([x_norm[-1], y_norm[-1]])
+    
+    max_dist = 0
+    elbow_idx = 0
+    
+    for i, (xi, yi) in enumerate(zip(x_norm, y_norm)):
+        # Distance from point to line
+        d = abs((p2[1] - p1[1]) * xi - (p2[0] - p1[0]) * yi + p2[0] * p1[1] - p2[1] * p1[0])
+        d /= np.sqrt((p2[1] - p1[1]) ** 2 + (p2[0] - p1[0]) ** 2) + 1e-10
+        
+        if d > max_dist:
+            max_dist = d
+            elbow_idx = i
+    
+    return k_values[elbow_idx]
+
+
+def cluster_prompts(
+    embeddings: np.ndarray,
+    metadata: List[Dict],
+    n_clusters: Optional[int] = None,
+    method: str = "silhouette"
+) -> Dict[str, Any]:
+    """
+    Cluster prompts based on their embeddings.
+    
+    Args:
+        embeddings: Normalized embedding vectors
+        metadata: List of prompt metadata dictionaries
+        n_clusters: Number of clusters (auto-determined if None)
+        method: Method for auto-determining k ("silhouette" or "elbow")
+    
+    Returns:
+        Dict containing:
+        - labels: cluster assignment for each prompt
+        - n_clusters: number of clusters used
+        - analysis: analysis data from find_optimal_clusters
+        - clusters: dict of cluster_id -> list of (prompt_idx, prompt_data)
+        - cluster_centers: centroids for each cluster
+    """
+    if not SKLEARN_AVAILABLE:
+        raise RuntimeError("scikit-learn is required for clustering. Install with: pip install scikit-learn")
+    
+    if len(embeddings) < 2:
+        return {
+            "labels": [0] * len(embeddings),
+            "n_clusters": 1,
+            "analysis": {},
+            "clusters": {0: [(i, metadata[i]) for i in range(len(metadata))]},
+            "cluster_centers": embeddings[:1] if len(embeddings) > 0 else [],
+        }
+    
+    # Auto-determine k if not provided
+    analysis = {}
+    if n_clusters is None:
+        n_clusters, analysis = find_optimal_clusters(embeddings, method=method)
+    
+    # Perform final clustering
+    kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
+    labels = kmeans.fit_predict(embeddings)
+    
+    # Organize prompts by cluster
+    clusters = {i: [] for i in range(n_clusters)}
+    for idx, label in enumerate(labels):
+        clusters[label].append((idx, metadata[idx]))
+    
+    # Compute final silhouette score
+    final_silhouette = silhouette_score(embeddings, labels) if n_clusters > 1 else 0.0
+    
+    return {
+        "labels": labels.tolist(),
+        "n_clusters": n_clusters,
+        "analysis": analysis,
+        "clusters": clusters,
+        "cluster_centers": kmeans.cluster_centers_,
+        "silhouette_score": final_silhouette,
+    }
+
+
+def reduce_to_2d(embeddings: np.ndarray, perplexity: int = 30) -> np.ndarray:
+    """
+    Reduce high-dimensional embeddings to 2D using t-SNE for visualization.
+    
+    Args:
+        embeddings: High-dimensional embedding vectors
+        perplexity: t-SNE perplexity parameter (default 30)
+    
+    Returns:
+        2D coordinates for each embedding (n_samples, 2)
+    """
+    if not SKLEARN_AVAILABLE:
+        raise RuntimeError("scikit-learn is required for dimensionality reduction. Install with: pip install scikit-learn")
+    
+    if len(embeddings) < 2:
+        return np.zeros((len(embeddings), 2))
+    
+    # Adjust perplexity for small datasets
+    perplexity = min(perplexity, len(embeddings) - 1)
+    perplexity = max(perplexity, 5)
+    
+    tsne = TSNE(
+        n_components=2,
+        perplexity=perplexity,
+        random_state=42,
+        n_iter=1000,
+        init='pca',
+        learning_rate='auto',
+    )
+    
+    return tsne.fit_transform(embeddings)
+
+
+def get_cluster_keywords(prompts: List[Dict], top_n: int = 10) -> List[str]:
+    """
+    Extract top keywords from a list of prompts.
+    
+    Args:
+        prompts: List of prompt dictionaries with 'text' field
+        top_n: Number of top keywords to return
+    
+    Returns:
+        List of top keywords sorted by frequency
+    """
+    stopwords = {
+        'the', 'a', 'an', 'is', 'it', 'to', 'and', 'of', 'in', 'for', 'on', 'with',
+        'this', 'that', 'i', 'you', 'we', 'be', 'are', 'was', 'have', 'has', 'do',
+        'does', 'can', 'will', 'would', 'should', 'could', 'if', 'then', 'else',
+        'when', 'what', 'how', 'why', 'where', 'which', 'who', 'or', 'not', 'no',
+        'yes', 'my', 'your', 'our', 'their', 'its', 'as', 'at', 'by', 'from',
+        'into', 'about', 'all', 'any', 'but', 'so', 'up', 'out', 'just', 'now',
+        'only', 'also', 'than', 'more', 'some', 'very', 'too', 'each', 'other',
+        'such', 'make', 'like', 'use', 'get', 'add', 'new', 'please', 'want',
+        'need', 'code', 'file', 'using', 'create', 'change', 'update',
+    }
+    
+    word_freq = {}
+    for prompt in prompts:
+        text = prompt.get('text', '') if isinstance(prompt, dict) else str(prompt)
+        words = text.lower().split()
+        for word in words:
+            word = ''.join(c for c in word if c.isalnum())
+            if len(word) > 2 and word not in stopwords:
+                word_freq[word] = word_freq.get(word, 0) + 1
+    
+    sorted_words = sorted(word_freq.items(), key=lambda x: x[1], reverse=True)
+    return [word for word, _ in sorted_words[:top_n]]
 
 
 # =============================================================================
