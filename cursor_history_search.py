@@ -119,7 +119,9 @@ CREATE TABLE IF NOT EXISTS conversations (
     files_changed_count INTEGER DEFAULT 0,
     files_changed_list TEXT,
     context_usage_pct REAL,
-    prompt_count INTEGER DEFAULT 0
+    prompt_count INTEGER DEFAULT 0,
+    mode TEXT,
+    last_used_model TEXT
 );
 
 -- Daily aggregate stats from aiCodeTracking
@@ -195,6 +197,16 @@ def init_analytics_db(db_path: Path) -> sqlite3.Connection:
     # Create tables
     cursor.executescript(ANALYTICS_SCHEMA)
     
+    # Migrate: add new columns if they don't exist
+    # Check existing columns in conversations table
+    cursor.execute("PRAGMA table_info(conversations)")
+    existing_cols = {row[1] for row in cursor.fetchall()}
+    
+    if "mode" not in existing_cols:
+        cursor.execute("ALTER TABLE conversations ADD COLUMN mode TEXT")
+    if "last_used_model" not in existing_cols:
+        cursor.execute("ALTER TABLE conversations ADD COLUMN last_used_model TEXT")
+    
     # Create views
     cursor.executescript(ANALYTICS_VIEWS)
     
@@ -210,8 +222,21 @@ def get_analytics_db(db_path: Path = None) -> sqlite3.Connection:
     if not db_path.exists():
         return init_analytics_db(db_path)
     
+    # Open existing database and run migrations
     conn = sqlite3.connect(str(db_path))
     conn.row_factory = sqlite3.Row
+    
+    # Check for and add missing columns (migration)
+    cursor = conn.cursor()
+    cursor.execute("PRAGMA table_info(conversations)")
+    existing_cols = {row[1] for row in cursor.fetchall()}
+    
+    if "mode" not in existing_cols:
+        cursor.execute("ALTER TABLE conversations ADD COLUMN mode TEXT")
+    if "last_used_model" not in existing_cols:
+        cursor.execute("ALTER TABLE conversations ADD COLUMN last_used_model TEXT")
+    conn.commit()
+    
     return conn
 
 
@@ -286,17 +311,14 @@ def _streamlit_app():
         row = cursor.fetchone()
         total_conversations, lines_added, lines_removed = row[0], row[1], row[2]
         
-        cursor.execute("""
-            SELECT SUM(composer_suggested_lines), SUM(composer_accepted_lines), COUNT(*)
-            FROM daily_stats
-        """)
-        row = cursor.fetchone()
-        suggested, accepted, days = row[0] or 0, row[1] or 0, row[2]
-        # Cap at 100% - Cursor data sometimes has accepted > suggested
-        acceptance_rate = min((accepted / suggested * 100), 100.0) if suggested > 0 else 0
+        cursor.execute("SELECT COUNT(*) FROM daily_stats")
+        days_tracked = cursor.fetchone()[0] or 1
         
         cursor.execute("SELECT COUNT(DISTINCT project) FROM prompts")
         unique_projects = cursor.fetchone()[0]
+        
+        # Calculate average prompts per day
+        avg_prompts_per_day = total_prompts / days_tracked if days_tracked > 0 else 0
         
         conn.close()
         return {
@@ -304,9 +326,9 @@ def _streamlit_app():
             "total_conversations": total_conversations,
             "lines_added": lines_added,
             "lines_removed": lines_removed,
-            "acceptance_rate": acceptance_rate,
-            "days_tracked": days,
+            "days_tracked": days_tracked,
             "unique_projects": unique_projects,
+            "avg_prompts_per_day": avg_prompts_per_day,
         }
 
     def get_daily_trends(days=30):
@@ -374,6 +396,22 @@ def _streamlit_app():
         query += " ORDER BY last_updated_ms DESC LIMIT ?"
         params.append(limit)
         cursor.execute(query, params)
+        results = [dict(row) for row in cursor.fetchall()]
+        conn.close()
+        return results
+
+    def get_workspace_conversations(workspace_hash):
+        """Get all conversations for a workspace."""
+        conn = get_analytics_db()
+        if not conn:
+            return []
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT id, name, total_lines_added, total_lines_removed, last_updated_ms,
+                   mode, last_used_model
+            FROM conversations WHERE workspace_hash = ?
+            ORDER BY last_updated_ms DESC
+        """, (workspace_hash,))
         results = [dict(row) for row in cursor.fetchall()]
         conn.close()
         return results
@@ -613,7 +651,7 @@ def _streamlit_app():
             return np.zeros((len(embeddings), 2))
         
         perplexity = min(perplexity, max(5, len(embeddings) - 1))
-        tsne = TSNE(n_components=2, perplexity=perplexity, random_state=42, n_iter=1000, init='pca', learning_rate='auto')
+        tsne = TSNE(n_components=2, perplexity=perplexity, random_state=42, max_iter=1000, init='pca', learning_rate='auto')
         return tsne.fit_transform(embeddings)
 
     def get_cluster_keywords_st(prompts, top_n=10):
@@ -748,8 +786,8 @@ def _streamlit_app():
         if kpis:
             st.metric("Prompts", f"{kpis['total_prompts']:,}")
             st.metric("Conversations", f"{kpis['total_conversations']:,}")
-            st.metric("Acceptance Rate", f"{kpis['acceptance_rate']:.1f}%")
-            st.metric("Lines Added", f"{kpis['lines_added']:,}")
+            st.metric("Projects", f"{kpis['unique_projects']:,}")
+            st.metric("Lines Changed", f"{kpis['lines_added'] + kpis['lines_removed']:,}")
 
     # =========================================================================
     # Main Content - Tab Navigation
@@ -768,16 +806,66 @@ def _streamlit_app():
             st.rerun()
         
         st.title(f"Session: `{project}`")
+        
+        # Show conversations in this session
+        conversations = get_workspace_conversations(ws_hash)
+        if conversations:
+            with st.expander(f"**💬 {len(conversations)} Conversation(s) in this session**", expanded=True):
+                for conv in conversations:
+                    name = conv.get("name") or "(unnamed)"
+                    lines_added = conv.get("total_lines_added", 0)
+                    lines_removed = conv.get("total_lines_removed", 0)
+                    total_lines = lines_added + lines_removed
+                    ts = conv.get("last_updated_ms")
+                    date_str = datetime.fromtimestamp(ts / 1000).strftime("%Y-%m-%d %H:%M") if ts else ""
+                    mode = conv.get("mode") or ""
+                    model = conv.get("last_used_model") or ""
+                    # Format model name (shorten if too long)
+                    model_short = model[:25] + "..." if len(model) > 25 else model
+                    meta_parts = [f"{total_lines:,} lines"]
+                    if mode:
+                        meta_parts.append(f"mode: {mode}")
+                    if model_short:
+                        meta_parts.append(f"model: {model_short}")
+                    if date_str:
+                        meta_parts.append(date_str)
+                    st.markdown(f"- **{name}** — {' | '.join(meta_parts)}")
+        
         _, metadata, _ = load_index()
         session_prompts = get_session_prompts(ws_hash, metadata)
         st.info(f"**{len(session_prompts)} prompts** in this session")
+        
+        # Build conversation name lookup
+        conv_name_lookup = {conv.get("id"): conv.get("name") for conv in conversations if conv.get("id")}
         
         for prompt in session_prompts:
             idx = prompt["prompt_index"]
             is_highlight = (idx == highlight_idx)
             css_class = "session-prompt-highlight" if is_highlight else "session-prompt"
             label = ">>> MATCH" if is_highlight else f"#{idx}"
-            st.markdown(f'<div class="{css_class}"><span class="prompt-index">{label}</span>{prompt["text"]}</div>', unsafe_allow_html=True)
+            
+            # Get conversation name if available (direct link or inferred)
+            conv_id = prompt.get("conversation_id")
+            conv_name = conv_name_lookup.get(conv_id) if conv_id else None
+            # Also check if prompt has conversation_name directly (from store extraction)
+            if not conv_name:
+                conv_name = prompt.get("conversation_name")
+            
+            # Check for inferred conversation name
+            inferred_name = prompt.get("inferred_conversation_name")
+            inference_score = prompt.get("inference_score", 0)
+            
+            if conv_name:
+                # Direct link - solid badge
+                conv_badge = f'<span style="background-color: #4a5568; color: #e2e8f0; padding: 2px 8px; border-radius: 4px; font-size: 0.75em; margin-left: 8px;">📝 {conv_name}</span>'
+            elif inferred_name:
+                # Inferred link - dashed border badge with score
+                score_pct = int(inference_score * 100)
+                conv_badge = f'<span style="background-color: transparent; color: #a0aec0; padding: 2px 8px; border-radius: 4px; font-size: 0.75em; margin-left: 8px; border: 1px dashed #718096;" title="Inferred match ({score_pct}% confidence)">🔍 {inferred_name}</span>'
+            else:
+                conv_badge = ""
+            
+            st.markdown(f'<div class="{css_class}"><span class="prompt-index">{label}</span>{conv_badge}{prompt["text"]}</div>', unsafe_allow_html=True)
 
     else:
         # Tab Navigation
@@ -800,7 +888,7 @@ def _streamlit_app():
                 with cols[2]:
                     st.markdown(f'<div class="kpi-card"><div class="kpi-value">{kpis["lines_added"]:,}</div><div class="kpi-label">Lines Added</div></div>', unsafe_allow_html=True)
                 with cols[3]:
-                    st.markdown(f'<div class="kpi-card"><div class="kpi-value">{kpis["acceptance_rate"]:.1f}%</div><div class="kpi-label">Acceptance Rate</div></div>', unsafe_allow_html=True)
+                    st.markdown(f'<div class="kpi-card"><div class="kpi-value">{kpis["unique_projects"]:,}</div><div class="kpi-label">Projects</div></div>', unsafe_allow_html=True)
                 
                 st.markdown("---")
                 
@@ -1187,8 +1275,8 @@ def _streamlit_app():
                         "\n## Overview",
                         f"- Prompts: {kpis['total_prompts']:,}" if kpis else "",
                         f"- Conversations: {kpis['total_conversations']:,}" if kpis else "",
-                        f"- Lines Added: {kpis['lines_added']:,}" if kpis else "",
-                        f"- Acceptance Rate: {kpis['acceptance_rate']:.1f}%" if kpis else "",
+                        f"- Projects: {kpis['unique_projects']:,}" if kpis else "",
+                        f"- Lines Changed: {kpis['lines_added'] + kpis['lines_removed']:,}" if kpis else "",
                     ]
                     output = "\n".join(lines)
                     st.markdown(output)
@@ -1355,6 +1443,9 @@ def extract_composer_data_from_workspace(workspace_path: Path) -> List[Dict[str,
                         subtitle = item.get("subtitle", "")
                         files_list = [f.strip() for f in subtitle.split(",") if f.strip()] if subtitle else []
                         
+                        # Get mode - prefer unifiedMode, fall back to forceMode
+                        mode = item.get("unifiedMode") or item.get("forceMode")
+                        
                         conversations.append({
                             "id": item.get("composerId"),
                             "workspace_hash": workspace_path.name,
@@ -1367,6 +1458,7 @@ def extract_composer_data_from_workspace(workspace_path: Path) -> List[Dict[str,
                             "files_changed_count": item.get("filesChangedCount", 0),
                             "files_changed_list": json.dumps(files_list),
                             "context_usage_pct": item.get("contextUsagePercent"),
+                            "mode": mode,
                         })
             except json.JSONDecodeError:
                 pass
@@ -1491,6 +1583,123 @@ def extract_plans() -> List[Dict[str, Any]]:
     return plans
 
 
+def extract_conversation_stores() -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """
+    Extract conversation data and prompts from .cursor/chats/ stores.
+    
+    These stores contain richer data including:
+    - Conversation name
+    - Model used (e.g., "claude-4.5-opus-high-thinking")
+    - Conversation mode (default, agent, etc.)
+    - Creation timestamp
+    - User prompts with conversation linkage
+    
+    Returns:
+        Tuple of (conversations, prompts) where prompts have conversation_id
+    """
+    chats_dir = Path.home() / ".cursor" / "chats"
+    if not chats_dir.exists():
+        return [], []
+    
+    conversations = []
+    prompts = []
+    
+    for ws_dir in chats_dir.iterdir():
+        if not ws_dir.is_dir():
+            continue
+        
+        workspace_hash = ws_dir.name
+        
+        for conv_dir in ws_dir.iterdir():
+            if not conv_dir.is_dir():
+                continue
+            
+            store_db = conv_dir / "store.db"
+            if not store_db.exists():
+                continue
+            
+            try:
+                uri = f"file:{store_db}?mode=ro"
+                conn = sqlite3.connect(uri, uri=True)
+                cursor = conn.cursor()
+                
+                # Get meta data
+                cursor.execute('SELECT value FROM meta WHERE key = "0"')
+                row = cursor.fetchone()
+                
+                conv_id = None
+                conv_name = None
+                
+                if row and row[0]:
+                    try:
+                        # Meta value is hex-encoded JSON
+                        meta = json.loads(bytes.fromhex(row[0]).decode('utf-8'))
+                        conv_id = meta.get("agentId")
+                        conv_name = meta.get("name")
+                        
+                        conversations.append({
+                            "id": conv_id,
+                            "workspace_hash": workspace_hash,
+                            "name": conv_name,
+                            "mode": meta.get("mode"),
+                            "last_used_model": meta.get("lastUsedModel"),
+                            "created_at_ms": meta.get("createdAt"),
+                            "store_path": str(store_db),
+                        })
+                    except (json.JSONDecodeError, ValueError):
+                        pass
+                
+                # Extract user prompts from blobs
+                if conv_id:
+                    cursor.execute('SELECT id, data FROM blobs')
+                    prompt_idx = 0
+                    for blob_row in cursor.fetchall():
+                        blob_id, data = blob_row
+                        try:
+                            # Find JSON start (header is variable length)
+                            text = data.decode('utf-8', errors='ignore')
+                            json_start = text.find('{')
+                            if json_start == -1:
+                                continue
+                            
+                            msg = json.loads(text[json_start:])
+                            if msg.get('role') == 'user':
+                                # Extract user message content
+                                content = msg.get('content', '')
+                                if isinstance(content, list):
+                                    # Handle content array format
+                                    for item in content:
+                                        if isinstance(item, dict) and item.get('type') == 'text':
+                                            content = item.get('text', '')
+                                            break
+                                if isinstance(content, str) and content.strip():
+                                    # Extract the actual user query from <user_query> tags if present
+                                    user_text = content
+                                    if '<user_query>' in content:
+                                        start = content.find('<user_query>') + len('<user_query>')
+                                        end = content.find('</user_query>')
+                                        if end > start:
+                                            user_text = content[start:end].strip()
+                                    
+                                    if user_text and len(user_text) > 5:  # Skip very short messages
+                                        prompts.append({
+                                            "text": user_text,
+                                            "workspace_hash": workspace_hash,
+                                            "conversation_id": conv_id,
+                                            "conversation_name": conv_name,
+                                            "prompt_index": prompt_idx,
+                                        })
+                                        prompt_idx += 1
+                        except (json.JSONDecodeError, UnicodeDecodeError):
+                            pass
+                
+                conn.close()
+            except sqlite3.Error:
+                pass
+    
+    return conversations, prompts
+
+
 def extract_all_prompts() -> Tuple[List[Dict[str, Any]], Dict[str, Dict]]:
     """
     Extract prompts from all Cursor workspaces.
@@ -1535,6 +1744,128 @@ def extract_all_prompts() -> Tuple[List[Dict[str, Any]], Dict[str, Dict]]:
         }
     
     return all_prompts, workspace_states
+
+
+def infer_conversation_links(
+    prompts: List[Dict[str, Any]], 
+    conversations: List[Dict[str, Any]]
+) -> int:
+    """
+    Heuristically match prompts to conversations based on keyword matching.
+    
+    For prompts without a conversation_id, attempts to find the best matching
+    conversation in the same workspace by comparing prompt text keywords
+    against conversation names.
+    
+    Args:
+        prompts: List of prompt dictionaries (modified in place)
+        conversations: List of conversation dictionaries
+    
+    Returns:
+        Number of prompts that were matched to a conversation
+    """
+    # Build lookup of conversations by workspace_hash
+    ws_conversations: Dict[str, List[Dict]] = {}
+    for conv in conversations:
+        ws_hash = conv.get("workspace_hash")
+        if ws_hash:
+            if ws_hash not in ws_conversations:
+                ws_conversations[ws_hash] = []
+            ws_conversations[ws_hash].append(conv)
+    
+    # Keywords to extract from prompts (technical terms that might appear in conversation names)
+    tech_keywords = {
+        'streamlit', 'dashboard', 'error', 'deploy', 'test', 'debug', 'notebook',
+        'snowflake', 'script', 'data', 'model', 'api', 'query', 'sql', 'python',
+        'function', 'procedure', 'table', 'view', 'schema', 'database', 'upload',
+        'download', 'export', 'import', 'config', 'setup', 'install', 'run',
+        'build', 'create', 'update', 'delete', 'fix', 'issue', 'bug', 'feature',
+        'typeerror', 'valueerror', 'keyerror', 'attributeerror', 'indexerror',
+        'syntaxerror', 'nameerror', 'exception', 'traceback', 'failure', 'failed',
+        'agv', 'prediction', 'classification', 'training', 'inference', 'oee',
+        'synthetic', 'determinism', 'parallel', 'concurrent', 'async', 'await',
+        'component', 'layout', 'chart', 'graph', 'plot', 'visualization', 'map',
+        'pydeck', 'plotly', 'altair', 'matplotlib', 'pandas', 'numpy', 'sklearn',
+    }
+    
+    # Common stopwords to ignore
+    stopwords = {
+        'the', 'a', 'an', 'is', 'it', 'to', 'and', 'of', 'in', 'for', 'on', 'with',
+        'this', 'that', 'i', 'you', 'we', 'be', 'are', 'was', 'have', 'has', 'do',
+        'does', 'can', 'will', 'would', 'should', 'could', 'if', 'then', 'else',
+        'when', 'what', 'how', 'why', 'where', 'which', 'who', 'or', 'not', 'no',
+        'yes', 'my', 'your', 'our', 'their', 'its', 'as', 'at', 'by', 'from',
+        'try', 'use', 'using', 'used', 'make', 'like', 'get', 'add', 'new', 'please',
+    }
+    
+    def extract_keywords(text: str) -> set:
+        """Extract meaningful keywords from text."""
+        words = set()
+        text_lower = text.lower()
+        # Extract words
+        for word in text_lower.split():
+            word = ''.join(c for c in word if c.isalnum())
+            if len(word) > 2 and word not in stopwords:
+                words.add(word)
+        # Also check for technical keywords as substrings
+        for kw in tech_keywords:
+            if kw in text_lower:
+                words.add(kw)
+        return words
+    
+    def score_match(prompt_keywords: set, conv_name: str) -> float:
+        """Score how well prompt keywords match a conversation name."""
+        if not conv_name:
+            return 0.0
+        conv_words = extract_keywords(conv_name)
+        if not conv_words:
+            return 0.0
+        # Calculate overlap
+        overlap = prompt_keywords & conv_words
+        if not overlap:
+            return 0.0
+        # Score based on overlap ratio (weighted towards conversation name coverage)
+        conv_coverage = len(overlap) / len(conv_words)
+        prompt_relevance = len(overlap) / min(len(prompt_keywords), 10)  # Cap at 10 to avoid dilution
+        return (conv_coverage * 0.7) + (prompt_relevance * 0.3)
+    
+    inferred_count = 0
+    
+    for prompt in prompts:
+        # Skip if already has conversation_id
+        if prompt.get("conversation_id"):
+            continue
+        
+        ws_hash = prompt.get("workspace_hash")
+        if not ws_hash or ws_hash not in ws_conversations:
+            continue
+        
+        # Extract keywords from prompt
+        prompt_text = prompt.get("text", "")
+        prompt_keywords = extract_keywords(prompt_text)
+        
+        if not prompt_keywords:
+            continue
+        
+        # Score all conversations in this workspace
+        best_match = None
+        best_score = 0.0
+        
+        for conv in ws_conversations[ws_hash]:
+            conv_name = conv.get("name")
+            score = score_match(prompt_keywords, conv_name)
+            if score > best_score:
+                best_score = score
+                best_match = conv
+        
+        # Only assign if score is above threshold (0.15 = meaningful keyword overlap)
+        if best_match and best_score >= 0.15:
+            prompt["inferred_conversation_id"] = best_match.get("id")
+            prompt["inferred_conversation_name"] = best_match.get("name")
+            prompt["inference_score"] = best_score
+            inferred_count += 1
+    
+    return inferred_count
 
 
 def extract_all_analytics_data() -> Dict[str, Any]:
@@ -1590,6 +1921,41 @@ def extract_all_analytics_data() -> Dict[str, Any]:
     print("Extracting plans...")
     plans = extract_plans()
     print(f"  Found {len(plans)} plans")
+    
+    # Extract conversation stores for model info and prompts with conversation linkage
+    print("Extracting conversation stores for model info and linked prompts...")
+    conversation_stores, store_prompts = extract_conversation_stores()
+    print(f"  Found {len(conversation_stores)} conversation stores with {len(store_prompts)} linked prompts")
+    
+    # Merge model info from conversation stores into conversations
+    store_lookup = {cs["id"]: cs for cs in conversation_stores if cs.get("id")}
+    for conv in all_conversations:
+        conv_id = conv.get("id")
+        if conv_id and conv_id in store_lookup:
+            store_data = store_lookup[conv_id]
+            conv["last_used_model"] = store_data.get("last_used_model")
+            # Override mode if we have it from the store
+            if store_data.get("mode"):
+                conv["mode"] = store_data.get("mode")
+    
+    # Add conversation_id to prompts from stores and merge into all_prompts
+    # Create lookup to add project name to store prompts
+    ws_project_lookup = {ws: state.get("project") for ws, state in workspace_states.items()}
+    for prompt in store_prompts:
+        ws_hash = prompt.get("workspace_hash")
+        prompt["project"] = ws_project_lookup.get(ws_hash) or "Unknown"
+    
+    # Merge store prompts - these have conversation_id which the regular prompts don't have
+    # We'll keep both sets but mark the store prompts
+    for prompt in store_prompts:
+        prompt["has_conversation_link"] = True
+    
+    all_prompts.extend(store_prompts)
+    
+    # Heuristic matching: try to infer conversation for prompts without conversation_id
+    print("Inferring conversation links for prompts without direct linkage...")
+    inferred_count = infer_conversation_links(all_prompts, all_conversations)
+    print(f"  Inferred conversation for {inferred_count} prompts")
     
     return {
         "prompts": all_prompts,
@@ -1649,8 +2015,8 @@ def populate_analytics_db(analytics_data: Dict[str, Any], db_path: Path = None) 
         
         cursor.execute("""
             INSERT OR REPLACE INTO prompts 
-            (workspace_hash, project, prompt_index, text, timestamp_ms, generation_uuid)
-            VALUES (?, ?, ?, ?, ?, ?)
+            (workspace_hash, project, prompt_index, text, timestamp_ms, generation_uuid, conversation_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
         """, (
             prompt["workspace_hash"],
             prompt["project"],
@@ -1658,6 +2024,7 @@ def populate_analytics_db(analytics_data: Dict[str, Any], db_path: Path = None) 
             prompt["text"],
             timestamp_ms,
             gen_uuid,
+            prompt.get("conversation_id"),
         ))
     
     # Insert conversations
@@ -1667,8 +2034,8 @@ def populate_analytics_db(analytics_data: Dict[str, Any], db_path: Path = None) 
             INSERT OR REPLACE INTO conversations 
             (id, workspace_hash, project, name, created_at_ms, last_updated_ms,
              total_lines_added, total_lines_removed, files_changed_count, 
-             files_changed_list, context_usage_pct)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             files_changed_list, context_usage_pct, mode, last_used_model)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             conv["id"],
             conv["workspace_hash"],
@@ -1681,6 +2048,8 @@ def populate_analytics_db(analytics_data: Dict[str, Any], db_path: Path = None) 
             conv.get("files_changed_count", 0),
             conv.get("files_changed_list"),
             conv.get("context_usage_pct"),
+            conv.get("mode"),
+            conv.get("last_used_model"),
         ))
     
     # Insert daily stats
@@ -1738,7 +2107,7 @@ def get_dashboard_kpis(db_path: Path = None) -> Dict[str, Any]:
     
     Returns:
         Dict with: total_prompts, total_conversations, total_lines_added,
-                   total_lines_removed, acceptance_rate, days_tracked
+                   total_lines_removed, days_tracked, unique_projects, avg_prompts_per_day
     """
     conn = get_analytics_db(db_path)
     cursor = conn.cursor()
@@ -1759,21 +2128,16 @@ def get_dashboard_kpis(db_path: Path = None) -> Dict[str, Any]:
     total_lines_added = row[1]
     total_lines_removed = row[2]
     
-    # Get acceptance rate
-    cursor.execute("""
-        SELECT SUM(composer_suggested_lines), SUM(composer_accepted_lines), COUNT(*)
-        FROM daily_stats
-    """)
-    row = cursor.fetchone()
-    suggested = row[0] or 0
-    accepted = row[1] or 0
-    days_tracked = row[2]
-    # Cap at 100% - Cursor data sometimes has accepted > suggested
-    acceptance_rate = min((accepted / suggested * 100), 100.0) if suggested > 0 else 0
+    # Get days tracked
+    cursor.execute("SELECT COUNT(*) FROM daily_stats")
+    days_tracked = cursor.fetchone()[0] or 1
     
     # Get unique projects
     cursor.execute("SELECT COUNT(DISTINCT project) FROM prompts")
     unique_projects = cursor.fetchone()[0]
+    
+    # Calculate average prompts per day
+    avg_prompts_per_day = total_prompts / days_tracked if days_tracked > 0 else 0
     
     conn.close()
     
@@ -1782,9 +2146,9 @@ def get_dashboard_kpis(db_path: Path = None) -> Dict[str, Any]:
         "total_conversations": total_conversations,
         "total_lines_added": total_lines_added,
         "total_lines_removed": total_lines_removed,
-        "acceptance_rate": acceptance_rate,
         "days_tracked": days_tracked,
         "unique_projects": unique_projects,
+        "avg_prompts_per_day": avg_prompts_per_day,
     }
 
 
@@ -2158,7 +2522,7 @@ def reduce_to_2d(embeddings: np.ndarray, perplexity: int = 30) -> np.ndarray:
         n_components=2,
         perplexity=perplexity,
         random_state=42,
-        n_iter=1000,
+        max_iter=1000,
         init='pca',
         learning_rate='auto',
     )
@@ -2771,7 +3135,7 @@ def cmd_analytics(args):
     print(f"  Lines Added:          {kpis['total_lines_added']:,}")
     print(f"  Lines Removed:        {kpis['total_lines_removed']:,}")
     print(f"  Net Change:           {kpis['total_lines_added'] - kpis['total_lines_removed']:+,}")
-    print(f"  Acceptance Rate:      {kpis['acceptance_rate']:.1f}%")
+    print(f"  Avg Prompts/Day:      {kpis['avg_prompts_per_day']:.1f}")
     
     # Top Projects
     print("\n📁 TOP PROJECTS BY CODE IMPACT")
@@ -2975,9 +3339,9 @@ def cmd_export(args):
             f"- **Total Conversations:** {kpis['total_conversations']:,}",
             f"- **Unique Projects:** {kpis['unique_projects']}",
             f"- **Days Tracked:** {kpis['days_tracked']}",
+            f"- **Avg Prompts/Day:** {kpis['avg_prompts_per_day']:.1f}",
             f"- **Lines Added:** {kpis['total_lines_added']:,}",
             f"- **Lines Removed:** {kpis['total_lines_removed']:,}",
-            f"- **Acceptance Rate:** {kpis['acceptance_rate']:.1f}%",
             "\n## Projects by Code Impact\n",
             "| Project | Lines Added | Lines Removed | Conversations |",
             "|---------|-------------|---------------|---------------|",
